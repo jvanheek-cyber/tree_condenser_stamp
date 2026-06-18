@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tree-coarsening"
+version = "0.6.1"
+description = "BPE-like coarsening of labeled directed trees represented as NetworkX graphs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+  {name = "Tree Coarsening Contributors"}
+]
+dependencies = [
+  "networkx>=3.0"
+]
+
+[project.optional-dependencies]
+numba = [
+  "numpy>=1.24",
+  "numba>=0.60"
+]
+dev = [
+  "pytest>=7.0",
+  "nbformat>=5.0",
+  "nbclient>=0.8",
+  "ipykernel>=6.0"
+]
+
+[tool.setuptools.packages.find]
+include = ["tree_coarsening*"]
+
+[tool.setuptools.package-data]
+tree_coarsening = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
