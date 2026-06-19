@@ -11,7 +11,9 @@ import networkx as nx
 
 from .decoder import TreeDecoder
 from .encoder import TreeEncoder
-from .exceptions import NotFittedError
+from .exceptions import NotFittedError, ValidationError
+from .schema import RAW_INPUT_FLAG, GraphInput, as_graph_list, normalize_coarsenable_tree
+from .validation import validate_coarsenable_tree
 from .vocabulary import Token
 
 DecodeBy = Literal["node", "label", "type"]
@@ -20,8 +22,10 @@ DecodeBy = Literal["node", "label", "type"]
 class TreeCoarsener(ABC):
     """Base class for fitted tree coarseners.
 
-    Subclasses implement ``_fit``. The public ``fit`` method stores the produced
-    encoder and decoder in ``encoder_`` and ``decoder_`` and returns ``self``.
+    ``fit`` and ``transform`` accept either one directed tree or a sequence of
+    trees.  Subclasses always receive normalized copies satisfying the common
+    fitting contract: hashable ``label``/``type``, positive ``size``, numeric
+    ``time``, and provenance fields.  Output shape matches input shape.
     """
 
     encoder_: TreeEncoder | None
@@ -31,8 +35,11 @@ class TreeCoarsener(ABC):
         self,
         *,
         label_attr: str = "label",
+        type_attr: str = "type",
+        size_attr: str = "size",
         time_attr: str = "time",
         uid_attr: str = "uid",
+        super_label_attr: str = "super_label",
         super_uid_attr: str = "super_uids",
         attach_attr: str = "attach_map",
         validate_inputs: bool = True,
@@ -43,8 +50,11 @@ class TreeCoarsener(ABC):
             unknown = ", ".join(sorted(deprecated_kwargs))
             raise TypeError(f"unexpected keyword argument(s): {unknown}")
         self.label_attr = label_attr
+        self.type_attr = type_attr
+        self.size_attr = size_attr
         self.time_attr = time_attr
         self.uid_attr = uid_attr
+        self.super_label_attr = super_label_attr
         self.super_uid_attr = super_uid_attr
         self.attach_attr = attach_attr
         self.validate_inputs = validate_inputs
@@ -52,69 +62,119 @@ class TreeCoarsener(ABC):
         self.encoder_ = None
         self.decoder_ = None
 
-    def fit(self, graphs: Sequence[nx.DiGraph]) -> "TreeCoarsener":
-        """Fit on a nonempty sequence of directed rooted trees."""
+    def _prepare_graph(self, graph: nx.DiGraph) -> nx.DiGraph:
+        prepared = normalize_coarsenable_tree(
+            graph,
+            label_attr=self.label_attr,
+            type_attr=self.type_attr,
+            size_attr=self.size_attr,
+            time_attr=self.time_attr,
+            uid_attr=self.uid_attr,
+            super_label_attr=self.super_label_attr,
+            super_uid_attr=self.super_uid_attr,
+            attach_attr=self.attach_attr,
+            copy=True,
+        )
+        if self.validate_inputs:
+            validate_coarsenable_tree(
+                prepared,
+                label_attr=self.label_attr,
+                type_attr=self.type_attr,
+                size_attr=self.size_attr,
+                time_attr=self.time_attr,
+                super_label_attr=self.super_label_attr,
+                super_uid_attr=self.super_uid_attr,
+            )
+        return prepared
 
-        graphs = list(graphs)
-        if len(graphs) == 0:
-            raise ValueError("fit requires at least one graph.")
-        encoder, decoder = self._fit(graphs)
+    def fit(self, graphs: GraphInput) -> "TreeCoarsener":
+        """Fit on one tree or a nonempty sequence of trees."""
+
+        graph_list, _ = as_graph_list(graphs)
+        prepared = [self._prepare_graph(graph) for graph in graph_list]
+        input_stages = {
+            bool(graph.graph.get(RAW_INPUT_FLAG, False)) for graph in prepared
+        }
+        if len(input_stages) != 1:
+            raise ValidationError(
+                "one fit call cannot mix raw trees with previously transformed "
+                "trees; fit each pipeline stage on one common graph schema."
+            )
+        encoder, decoder = self._fit(prepared)
         self.encoder_ = encoder
         self.decoder_ = decoder
         return self
 
-    def transform(self, graph: nx.DiGraph, *, validate: bool = True) -> nx.DiGraph:
-        """Encode one graph using the fitted encoder."""
+    def transform(
+        self,
+        graphs: GraphInput,
+        *,
+        validate: bool = True,
+    ) -> nx.DiGraph | list[nx.DiGraph]:
+        """Encode one tree or a sequence, preserving the input container shape."""
 
         if self.encoder_ is None:
             raise NotFittedError("Call fit before transform.")
-        return self.encoder_.encode(graph, validate=validate)
+        graph_list, was_single = as_graph_list(graphs, argument_name="graphs")
+        outputs = [
+            self.encoder_.encode(self._prepare_graph(graph), validate=validate)
+            for graph in graph_list
+        ]
+        return outputs[0] if was_single else outputs
 
     def fit_transform(
-        self, graphs: Sequence[nx.DiGraph], *, validate: bool = True
-    ) -> list[nx.DiGraph]:
-        """Fit on ``graphs`` and return their encoded forms."""
+        self,
+        graphs: GraphInput,
+        *,
+        validate: bool = True,
+    ) -> nx.DiGraph | list[nx.DiGraph]:
+        """Fit and transform one tree or a sequence of trees."""
 
         self.fit(graphs)
-        return [self.transform(G, validate=validate) for G in graphs]
+        return self.transform(graphs, validate=validate)
 
     def decode(
         self,
-        graph: nx.DiGraph,
+        graphs: GraphInput,
         *,
         target: Hashable | Token | None = None,
         by: DecodeBy = "node",
         recursive: bool = True,
         boundary_policy: Literal["expand", "raise"] = "expand",
         validate: bool = True,
-    ) -> nx.DiGraph:
-        """Decode using the fitted decoder."""
+    ) -> nx.DiGraph | list[nx.DiGraph]:
+        """Decode one tree or a sequence, preserving the input container shape."""
 
         if self.decoder_ is None:
             raise NotFittedError("Call fit before decode.")
-        return self.decoder_.decode(
-            graph,
-            target=target,
-            by=by,
-            recursive=recursive,
-            boundary_policy=boundary_policy,
-            validate=validate,
-        )
+        graph_list, was_single = as_graph_list(graphs, argument_name="graphs")
+        outputs = [
+            self.decoder_.decode(
+                graph,
+                target=target,
+                by=by,
+                recursive=recursive,
+                boundary_policy=boundary_policy,
+                validate=validate,
+            )
+            for graph in graph_list
+        ]
+        return outputs[0] if was_single else outputs
 
     def inverse_transform(
         self,
-        graph: nx.DiGraph,
+        graphs: GraphInput,
         *,
         target: Hashable | Token | None = None,
         by: DecodeBy = "node",
         recursive: bool = True,
         boundary_policy: Literal["expand", "raise"] = "expand",
         validate: bool = True,
-    ) -> nx.DiGraph:
+    ) -> nx.DiGraph | list[nx.DiGraph]:
         """Alias for ``decode`` using transformer-style naming."""
 
         return self.decode(
-            graph,
+            graphs,
             target=target,
             by=by,
             recursive=recursive,
@@ -122,7 +182,7 @@ class TreeCoarsener(ABC):
             validate=validate,
         )
 
-    def fit_artifacts(self, graphs: Sequence[nx.DiGraph]) -> tuple[TreeEncoder, TreeDecoder]:
+    def fit_artifacts(self, graphs: GraphInput) -> tuple[TreeEncoder, TreeDecoder]:
         """Fit and return ``(encoder, decoder)`` directly."""
 
         self.fit(graphs)
@@ -131,4 +191,4 @@ class TreeCoarsener(ABC):
 
     @abstractmethod
     def _fit(self, graphs: Sequence[nx.DiGraph]) -> tuple[TreeEncoder, TreeDecoder]:
-        """Subclass implementation for fitting."""
+        """Subclass implementation for fitting normalized trees."""

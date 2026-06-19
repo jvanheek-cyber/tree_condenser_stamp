@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import networkx as nx
 
-from tree_coarsening import StarCoarsener, base_token, star_token
+from tree_coarsening import CompositeType, StarCoarsener, base_token, star_token
 from tree_coarsening.provenance import PROVENANCE_KEY
+
+
+EXPECTED_ENCODED_NODE_FIELDS = {
+    "label", "type", "size", "time", "super_label", "super_uids"
+}
 from tree_coarsening.utils import make_starburst_dataset
 
 
@@ -36,15 +41,19 @@ def test_star_schema_is_minimal_and_integer_keyed() -> None:
     assert PROVENANCE_KEY in H.graph
 
     for _, data in H.nodes(data=True):
-        assert set(data) == {"label", "super_uids"}
-        assert "type" not in data
+        assert set(data) == EXPECTED_ENCODED_NODE_FIELDS
         assert "uid" not in data
-        assert "time" not in data
+        assert isinstance(data["time"], float)
         assert isinstance(data["super_uids"], tuple)
+        assert data["size"] == len(data["super_uids"])
         assert data["label"] in coarsener.encoder_.vocab
+        if isinstance(data["type"], CompositeType):
+            assert data["type"].label == data["label"]
+        else:
+            assert data["type"] == base_token(data["label"])
 
     assert any(data["label"] == star_token("P", "S", 4) for _, data in H.nodes(data=True))
-    assert any(data["label"] == base_token("P") for _, data in H.nodes(data=True))
+    assert any(data["label"] == "P" for _, data in H.nodes(data=True))
 
 
 def test_full_roundtrip_recovers_labels_times_and_edges_by_uid() -> None:
@@ -90,7 +99,7 @@ def test_partial_decode_by_node_and_by_label_roundtrip() -> None:
     assert star_nodes
 
     H_node = coarsener.decode(H, target=star_nodes[0], by="node", recursive=False)
-    assert all(set(data) == {"label", "super_uids"} for _, data in H_node.nodes(data=True))
+    assert all(set(data) == EXPECTED_ENCODED_NODE_FIELDS for _, data in H_node.nodes(data=True))
     assert uid_edge_set(X[0]) == set(coarsener.decode(H_node).edges)
 
     H_label = coarsener.decode(H, target=star_token("P", "S", 4), by="label", recursive=True)
