@@ -11,6 +11,7 @@ import networkx as nx
 
 from .exceptions import ValidationError
 from .nx_io import edge_attach_attrs, relabel_to_consecutive_topological
+from .schema import encoded_node_attrs, max_component_time
 from .provenance import (
     copy_graph_provenance,
     get_node_attrs_by_uid,
@@ -35,11 +36,14 @@ class TreeDecoder(ABC):
 
     model_id: str
     vocab: Vocabulary
-    base_labels: frozenset[str] = frozenset()
+    base_labels: frozenset[Token] = frozenset()
 
     label_attr: str = "label"
+    type_attr: str = "type"
+    size_attr: str = "size"
     time_attr: str = "time"
     uid_attr: str = "uid"
+    super_label_attr: str = "super_label"
     super_uid_attr: str = "super_uids"
     attach_attr: str = "attach_map"
 
@@ -98,7 +102,10 @@ class StagedTreeDecoder(TreeDecoder):
         if boundary_policy not in {"expand", "raise"}:
             raise ValueError("boundary_policy must be 'expand' or 'raise'.")
         if by == "type":
-            by = "label"  # compatibility alias; encoded graphs no longer use a type attribute.
+            # Legacy staged vocabularies are selected by token label.  Keep the
+            # historical ``by='type'`` spelling as an alias without claiming
+            # that modern encoded graphs lack an exact ``type`` field.
+            by = "label"
         if by not in {"node", "label"}:
             raise ValueError("by must be 'node' or 'label'.")
 
@@ -107,6 +114,10 @@ class StagedTreeDecoder(TreeDecoder):
                 H,
                 vocab=self.vocab,
                 label_attr=self.label_attr,
+                type_attr=self.type_attr,
+                size_attr=self.size_attr,
+                time_attr=self.time_attr,
+                super_label_attr=self.super_label_attr,
                 super_uid_attr=self.super_uid_attr,
                 attach_attr=self.attach_attr,
             )
@@ -227,6 +238,10 @@ class StagedTreeDecoder(TreeDecoder):
                 out,
                 vocab=self.vocab,
                 label_attr=self.label_attr,
+                type_attr=self.type_attr,
+                size_attr=self.size_attr,
+                time_attr=self.time_attr,
+                super_label_attr=self.super_label_attr,
                 super_uid_attr=self.super_uid_attr,
                 attach_attr=self.attach_attr,
             )
@@ -384,11 +399,15 @@ class StagedTreeDecoder(TreeDecoder):
         if mode == "full":
             return self._decompose_node_full(node, token, super_uids, provenance)
         if mode == "one":
-            return self._decompose_node_one_level(node, token, super_uids)
+            return self._decompose_node_one_level(node, token, super_uids, provenance)
         raise ValidationError(f"unknown partial decomposition mode {mode!r}.")
 
     def _decompose_node_one_level(
-        self, source_node: Hashable, token: Token, super_uids: Any
+        self,
+        source_node: Hashable,
+        token: Token,
+        super_uids: Any,
+        provenance: Mapping[Any, Mapping[str, Any]],
     ) -> _EncodedDecomposition:
         entry = self.vocab.entries[token]
         pieces = split_super_uids(token, super_uids, self.vocab)
@@ -400,10 +419,30 @@ class StagedTreeDecoder(TreeDecoder):
         for i, child_token in enumerate(entry.label):
             key = self._partial_node_key(source_node, ("one", i))
             component_keys.append(key)
-            nodes[key] = {
-                self.label_attr: child_token,
-                self.super_uid_attr: pieces[i],
-            }
+            piece = pieces[i]
+            piece_times = [
+                provenance[uid][self.time_attr]
+                for uid in piece
+                if uid in provenance and self.time_attr in provenance[uid]
+            ]
+            if len(piece_times) != len(piece):
+                raise ValidationError(
+                    f"cannot recover times for every UID while partially decoding {token!r}."
+                )
+            nodes[key] = encoded_node_attrs(
+                label=child_token,
+                type_token=child_token,
+                size=len(piece),
+                time=max_component_time(*piece_times),
+                super_label=piece[0] if len(piece) == 1 else piece,
+                super_uids=piece,
+                label_attr=self.label_attr,
+                type_attr=self.type_attr,
+                size_attr=self.size_attr,
+                time_attr=self.time_attr,
+                super_label_attr=self.super_label_attr,
+                super_uid_attr=self.super_uid_attr,
+            )
 
         attachment_slices = entry.attachment_slices(self.vocab)
         for i, p in enumerate(entry.parent):
@@ -449,10 +488,21 @@ class StagedTreeDecoder(TreeDecoder):
                 raise ValidationError(f"missing raw label for expanded uid {uid!r}.")
             key = self._partial_node_key(source_node, ("full", uid))
             key_by_uid[uid] = key
-            nodes[key] = {
-                self.label_attr: base_token(raw_label),
-                self.super_uid_attr: (uid,),
-            }
+            base_type = base_token(raw_label)
+            nodes[key] = encoded_node_attrs(
+                label=base_type,
+                type_token=base_type,
+                size=1,
+                time=attrs.get(self.time_attr, 0.0),
+                super_label=uid,
+                super_uids=(uid,),
+                label_attr=self.label_attr,
+                type_attr=self.type_attr,
+                size_attr=self.size_attr,
+                time_attr=self.time_attr,
+                super_label_attr=self.super_label_attr,
+                super_uid_attr=self.super_uid_attr,
+            )
 
         edges: list[tuple[Hashable, Hashable, Mapping[str, Any]]] = []
         for u, v in occurrence.edges:

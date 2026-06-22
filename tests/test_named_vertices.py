@@ -106,7 +106,7 @@ def test_label_selector_builds_direct_connected_tree_recipe() -> None:
 
     assert entry.operation == "component"
     assert entry.parent == (-1, 0, 0)
-    assert entry.label == (base_token("A"), base_token("B"), base_token("B"))
+    assert entry.label == ("A", "B", "B")
     assert entry.attach == (0, 0)
     assert coarsener.encoder_.vocab.root_count(token) == 1
     assert coarsener.encoder_.vocab.site_count(token) == 3

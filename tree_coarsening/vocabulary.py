@@ -16,6 +16,33 @@ Operation: TypeAlias = Literal["base", "edge", "siblings", "component"]
 BASE_NAMESPACE = "base"
 
 
+@dataclass(frozen=True, slots=True)
+class TokenSpec:
+    """Fixed expanded size/root metadata for an opaque fitting symbol."""
+
+    site_count: int
+    root_count: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.site_count, int)
+            or isinstance(self.site_count, bool)
+            or self.site_count <= 0
+        ):
+            raise ValidationError(
+                f"TokenSpec.site_count must be positive; got {self.site_count!r}."
+            )
+        if (
+            not isinstance(self.root_count, int)
+            or isinstance(self.root_count, bool)
+            or self.root_count <= 0
+        ):
+            raise ValidationError(
+                f"TokenSpec.root_count must be positive; got {self.root_count!r}."
+            )
+
+
+
 def base_token(raw_label: str) -> tuple[str, str]:
     """Return the base-token id for a raw string label."""
 
@@ -196,10 +223,18 @@ class Vocabulary:
 
     entries: dict[Token, VocabEntry] = field(default_factory=dict)
     creation_order: list[Token] = field(default_factory=list)
+    symbols: dict[Token, TokenSpec] = field(default_factory=dict)
     _root_counts: dict[Token, int] = field(default_factory=dict, init=False, repr=False)
     _site_counts: dict[Token, int] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self.symbols = dict(self.symbols)
+        overlap = set(self.entries) & set(self.symbols)
+        if overlap:
+            raise ValidationError(
+                f"tokens cannot be both static entries and opaque symbols: "
+                f"{sorted(overlap, key=repr)!r}."
+            )
         if not self.creation_order:
             self.creation_order = list(self.entries)
         else:
@@ -215,7 +250,7 @@ class Vocabulary:
             self._rebuild_count_caches()
 
     def __contains__(self, token: Token) -> bool:
-        return is_base_token(token) or token in self.entries
+        return is_base_token(token) or token in self.entries or token in self.symbols
 
     def __getitem__(self, token: Token) -> VocabEntry:
         return self.entries[token]
@@ -229,11 +264,29 @@ class Vocabulary:
     def as_mapping(self) -> dict[Token, VocabEntry]:
         return dict(self.entries)
 
+    def add_symbol(self, token: Token, spec: TokenSpec) -> None:
+        """Register an opaque fitting symbol with fixed coordinate counts."""
+
+        if not isinstance(token, HashableABC):
+            raise ValidationError(f"symbol token must be hashable; got {token!r}.")
+        if token in self.entries:
+            raise ValidationError(f"token {token!r} is already a static vocabulary entry.")
+        previous = self.symbols.get(token)
+        if previous is not None and previous != spec:
+            raise ValidationError(
+                f"symbol {token!r} already has specification {previous!r}, not {spec!r}."
+            )
+        self.symbols[token] = spec
+
     def add(self, entry: VocabEntry) -> None:
         """Add and validate one learned token, caching its counts immediately."""
 
         if entry.token in self.entries:
             raise ValidationError(f"duplicate vocabulary token {entry.token!r}.")
+        if entry.token in self.symbols:
+            raise ValidationError(
+                f"token {entry.token!r} is already registered as an opaque symbol."
+            )
         self.validate_entry(entry)
         site_count_value = sum(self.site_count(token) for token in entry.label)
         root_count_value = sum(
@@ -262,6 +315,8 @@ class Vocabulary:
 
         if is_base_token(token):
             return 1
+        if token in self.symbols:
+            return self.symbols[token].root_count
         try:
             return self._root_counts[token]
         except KeyError as exc:
@@ -275,6 +330,8 @@ class Vocabulary:
 
         if is_base_token(token):
             return 1
+        if token in self.symbols:
+            return self.symbols[token].site_count
         try:
             return self._site_counts[token]
         except KeyError as exc:
@@ -287,7 +344,11 @@ class Vocabulary:
         """Validate dependencies, attachment lengths, and attachment ranges."""
 
         for i, token in enumerate(entry.label):
-            if not is_base_token(token) and token not in self.entries:
+            if (
+                not is_base_token(token)
+                and token not in self.entries
+                and token not in self.symbols
+            ):
                 raise ValidationError(
                     f"entry {entry.token!r} references unknown or future token {token!r} "
                     f"at label[{i}]."
@@ -323,7 +384,11 @@ class Vocabulary:
         indegree: dict[Token, int] = {}
 
         for token, entry in self.entries.items():
-            deps = {child for child in entry.label if not is_base_token(child)}
+            deps = {
+                child
+                for child in entry.label
+                if not is_base_token(child) and child not in self.symbols
+            }
             missing = [child for child in deps if child not in self.entries]
             if missing:
                 raise ValidationError(
@@ -346,11 +411,23 @@ class Vocabulary:
             token = ready.popleft()
             entry = self.entries[token]
             self._site_counts[token] = sum(
-                1 if is_base_token(child) else self._site_counts[child]
+                (
+                    1
+                    if is_base_token(child)
+                    else self.symbols[child].site_count
+                    if child in self.symbols
+                    else self._site_counts[child]
+                )
                 for child in entry.label
             )
             self._root_counts[token] = sum(
-                1 if is_base_token(entry.label[i]) else self._root_counts[entry.label[i]]
+                (
+                    1
+                    if is_base_token(entry.label[i])
+                    else self.symbols[entry.label[i]].root_count
+                    if entry.label[i] in self.symbols
+                    else self._root_counts[entry.label[i]]
+                )
                 for i in entry.root_positions
             )
             processed += 1

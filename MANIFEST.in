@@ -1,0 +1,8 @@
+include README.md
+include pyproject.toml
+recursive-include docs *.md
+recursive-include benchmarks *.py
+recursive-include experiments *.ipynb
+recursive-include notebooks *.ipynb
+recursive-include tests *.py *.ipynb *.md
+recursive-include tree_coarsening py.typed

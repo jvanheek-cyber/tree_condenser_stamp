@@ -4,8 +4,17 @@ from .canonical import attachment_slice, external_root_positions, root_count, si
 from .coarsener import TreeCoarsener
 from .compose import combine
 from .decoder import LazyTreeDecoder, StagedTreeDecoder, TreeDecoder
+from .stage_decoder import StructuralStageDecoder
 from .encoder import EncodingRule, LazyTreeEncoder, TreeEncoder
 from .exceptions import NotFittedError, TreeCoarseningError, ValidationError
+from .schema import (
+    GraphInput,
+    as_graph_list,
+    encoded_node_attrs,
+    max_component_time,
+    normalize_coarsenable_tree,
+)
+from .structural import CompositeType
 from .provenance import (
     NODE_ATTRS_KEY,
     PROVENANCE_KEY,
@@ -39,9 +48,11 @@ from .utils import (
     make_starburst_dataset,
     random_galton_watson_tree,
 )
+from .validation import validate_coarsenable_tree
 from .vocabulary import (
     BASE_NAMESPACE,
     Token,
+    TokenSpec,
     VocabEntry,
     Vocabulary,
     base_token,
@@ -53,6 +64,12 @@ from .vocabulary import (
 
 __all__ = [
     "BASE_NAMESPACE",
+    "validate_coarsenable_tree",
+    "normalize_coarsenable_tree",
+    "max_component_time",
+    "encoded_node_attrs",
+    "as_graph_list",
+    "GraphInput",
     "NODE_ATTRS_KEY",
     "PROVENANCE_KEY",
     "EdgeBPECoarsener",
@@ -68,10 +85,13 @@ __all__ = [
     "NamedVertexEncoder",
     "NotFittedError",
     "StagedTreeDecoder",
+    "StructuralStageDecoder",
     "StarCoarsener",
     "StarEncoder",
     "StarRule",
     "Token",
+    "TokenSpec",
+    "CompositeType",
     "TreeCoarsener",
     "TreeCoarseningError",
     "TreeDecoder",

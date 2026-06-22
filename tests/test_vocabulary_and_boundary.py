@@ -110,7 +110,8 @@ def test_broad_sibling_boundary_policy() -> None:
         decoder.decode(H, target=0, by="node", recursive=False, boundary_policy="raise")
 
     H2 = decoder.decode(H, target=0, by="node", recursive=False, boundary_policy="expand")
-    assert all("type" not in data for _, data in H2.nodes(data=True))
+    assert all(data["type"] == data["label"] for _, data in H2.nodes(data=True))
+    assert all(data["size"] == len(data["super_uids"]) for _, data in H2.nodes(data=True))
     assert set(decoder.decode(H2).edges) == {("a", "b"), ("a", "c"), ("b", "d")}
 
 

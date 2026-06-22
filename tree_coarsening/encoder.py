@@ -31,11 +31,14 @@ class TreeEncoder(ABC):
     model_id: str
     vocab: Vocabulary
     rules: Sequence[EncodingRule] = field(default_factory=tuple)
-    base_labels: frozenset[str] = field(default_factory=frozenset)
+    base_labels: frozenset[Token] = field(default_factory=frozenset)
 
     label_attr: str = "label"
+    type_attr: str = "type"
+    size_attr: str = "size"
     time_attr: str = "time"
     uid_attr: str = "uid"
+    super_label_attr: str = "super_label"
     super_uid_attr: str = "super_uids"
     attach_attr: str = "attach_map"
 
