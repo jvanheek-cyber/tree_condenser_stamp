@@ -323,24 +323,23 @@ def test_multiple_graphs_transform_preserves_container_shape() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Bug reproduction: after encoding, a node has a child whose subtree is
-# *identical* to a subtree already merged inside that node.
+# Regression: a node must never keep a child whose subtree is *identical* to a
+# subtree already merged inside that node.
 #
-# Symptom (reported): a parent subtree contains, as one of its own children, a
-# subtree equal to a component the parent already absorbed.  Intuitively
-# identical children of a node should all be folded into it by one greedy chain,
-# so this should never happen -- and it reproduces on a tree from the *training*
-# set, at full encode, with no ``max_steps`` involved.
+# Symptom (once reported): a parent subtree contained, as one of its own
+# children, a subtree equal to a component the parent already absorbed.  It
+# reproduced on a tree from the *training* set, at full encode, with no
+# ``max_steps`` involved.
 #
-# Root cause (isolated below): the greedy chain extends by appending the *same
-# single child label* that was last merged.  It therefore only recognizes a
-# "star" of identical children when those children share one scalar edge label.
-# When a node accumulates a *compound* subtree by absorbing its pieces one base
-# label at a time, a sibling that is the very same compound subtree has already
-# been condensed into a single token.  That condensed sibling no longer presents
-# the raw child label the chain is looking for, so the chain cannot consume it
-# and it is stranded as a duplicate.  ``max_steps`` is irrelevant: the stranding
-# happens inside a single completed chain, at full encode.
+# Root cause (fixed): the greedy chain used to extend by appending only the
+# *same single child label* last merged, recognizing a "star" of identical
+# children only when they shared one scalar edge label.  When a node accumulated
+# a *compound* subtree by absorbing its pieces one base label at a time, a
+# sibling that was the very same compound subtree had already been condensed into
+# a single component token, which the raw-label chain could not consume -- so it
+# was stranded as a duplicate.  The fix extends the chain to absorb any child
+# whose label is structurally one of the new token's merged components (its
+# merge-closure), so condensed siblings are folded into the same chain.
 # --------------------------------------------------------------------------- #
 
 
@@ -456,20 +455,13 @@ def test_max_steps_does_not_strand_subtrees_on_simple_star() -> None:
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Greedy stars are detected on single edge labels only.  Identical "
-        "compound-subtree siblings get condensed to a token the raw-label chain "
-        "cannot absorb, stranding a duplicate subtree under its own parent."
-    ),
-)
 def test_repeated_compound_subtree_children_are_fully_merged() -> None:
-    """Desired invariant: no node has a child equal to a component it absorbed.
+    """No node keeps a child equal to a component it already absorbed.
 
-    Reproduces the reported bug on a *training* tree at full encode (no
-    ``max_steps``): the encoded graph contains a ``T2`` parent with a ``T1``
-    child while ``T2`` itself already merged a ``T1`` component.
+    Regression for the reported bug on a *training* tree at full encode (no
+    ``max_steps``): the greedy chain now absorbs the condensed ``T1`` sibling
+    instead of stranding it under a ``T2`` parent that already merged a ``T1``
+    component.
     """
 
     graph = repeated_compound_subtree_tree()
@@ -479,36 +471,31 @@ def test_repeated_compound_subtree_children_are_fully_merged() -> None:
     assert duplicate_child_subtree_edges(encoded) == []
 
 
-def test_repeated_compound_subtree_bug_is_independent_of_max_steps() -> None:
-    """The stranded-subtree symptom is an artifact of fully applying the chains.
+def test_repeated_compound_subtree_collapses_at_every_max_steps() -> None:
+    """The compound star folds into one chain, so no ``max_steps`` strands it.
 
-    It is not produced by ``max_steps`` cutting a chain mid-way: applying *all*
-    learned chain groups (equivalent to a full encode) yields the duplicate, and
-    a plain full encode yields the very same duplicate.  ``max_steps`` only ever
-    *reduces* how much is merged, so it cannot be the cause.
+    The condensed sibling is absorbed within the same chain group as the rest of
+    the star, so cutting between complete chains never leaves a duplicate child.
     """
 
     graph = repeated_compound_subtree_tree()
     encoder = GreedyStarBPECoarsener(min_pair_count=2).fit([graph]).encoder_
     n_groups = sum(encoder.group_starts)
 
-    full = duplicate_child_subtree_edges(encoder.encode(graph))
-    all_groups = duplicate_child_subtree_edges(
-        encoder.encode(graph, max_steps=n_groups)
-    )
-
-    # Exactly one compound sibling is stranded; applying every group reproduces
-    # the same duplicate that a full encode produces.
-    assert len(full) == 1
-    assert all_groups == full
+    for steps in range(n_groups + 2):
+        encoded = encoder.encode(graph, max_steps=steps)
+        assert duplicate_child_subtree_edges(encoded) == [], (
+            f"unexpected duplicate child subtree at max_steps={steps}"
+        )
+    assert duplicate_child_subtree_edges(encoder.encode(graph)) == []
 
 
 
-def test_repeated_compound_subtree_roundtrips_despite_duplicate() -> None:
-    """The encoding is still lossless even though it strands a duplicate.
+def test_repeated_compound_subtree_roundtrips() -> None:
+    """Folding the condensed sibling into the chain stays lossless.
 
-    The bug is purely about over-fragmented output structure, not data loss: the
-    stranded sibling decodes back to the original tree.
+    The fix only changes how aggressively the chain merges; decoding still
+    reconstructs the original tree exactly.
     """
 
     graph = repeated_compound_subtree_tree()

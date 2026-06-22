@@ -3,12 +3,14 @@
 This is an ordinary edge-BPE learner with a single twist in *rule selection*.
 After the global best ``(parent_label, child_label)`` pair is merged into a new
 token ``T``, fitting does **not** immediately return to the global frequency
-ranking.  Instead it greedily prefers the pair ``(T, child_label)`` -- the token
-just created paired with the very same child label -- as long as at least one
-such edge remains.  ``min_pair_count`` gates only the global pick that *starts*
-a chain; greedy continuations ignore it, so a star is consumed to its last
-child.  Repeating this contracts a parent's star of identical children before
-moving on, while the learned rules remain an ordinary ordered BPE merge table.
+ranking.  Instead it greedily prefers extending ``T`` with another child that is
+structurally one of ``T``'s own merged components -- the original repeated child
+*or* a sibling that has already been condensed into a component token -- as long
+as at least one such edge remains.  ``min_pair_count`` gates only the global pick
+that *starts* a chain; greedy continuations ignore it, so a star is consumed to
+its last child.  Recognizing condensed siblings (not just the raw child label)
+ensures a node never keeps a child whose subtree equals a component it already
+absorbed, while the learned rules remain an ordinary ordered BPE merge table.
 
 Because the rules are plain edge-BPE rules, encoding new data is exactly
 straightforward edge BPE: the fitted :class:`~tree_coarsening.EdgeBPEEncoder`
@@ -107,8 +109,11 @@ class GreedyStarBPECoarsener(EdgeBPECoarsener):
     and decoder are identical to :class:`~tree_coarsening.EdgeBPECoarsener`.  The
     only difference is the order in which pairs are selected during fitting:
     after a merge the coarsener prefers extending the freshly created token with
-    another copy of the same child, contracting a star of identical children one
-    sibling at a time before returning to the global frequency ranking.
+    another child that is structurally one of the token's own merged components
+    (its merge-closure), contracting a star of identical children one sibling at
+    a time before returning to the global frequency ranking.  Because condensed
+    siblings are matched by their component label -- not just the raw child label
+    -- a node never keeps a child equal to a component it already absorbed.
     ``min_pair_count`` gates only the global pick that starts a chain; greedy
     continuations ignore it and consume the star down to its last child.
 
@@ -183,6 +188,47 @@ class GreedyStarBPECoarsener(EdgeBPECoarsener):
             score=score,
         )
 
+    def _best_greedy_continuation(
+        self,
+        parent_id: int,
+        component_labels: frozenset[int],
+        counts: Counter[EdgeKey],
+        codec: _TokenCodec,
+        label_counts: Sequence[int],
+        label_sizes: Sequence[int],
+    ) -> _PairSelection | None:
+        """Best greedy continuation off the freshly created chain token.
+
+        The chain absorbs any remaining child of ``parent_id`` whose label is
+        structurally one of the token's own merged components (``component_labels``
+        is the merge-closure of the token).  This includes the original repeated
+        child *and* siblings that have already been condensed into a component
+        token -- the latter being the case the single-label chain used to strand.
+        Among all such candidates the highest-priority pair is chosen, mirroring
+        :meth:`_select_best_pair`'s ordering; ``min_pair_count`` does not apply.
+        """
+
+        best: _PairSelection | None = None
+        best_priority: tuple[float, int, str, str] | None = None
+        for child_id in component_labels:
+            key = (parent_id, child_id)
+            count = counts.get(key, 0)
+            if count < 1:
+                continue
+            selection = self._selection_for_key(
+                key, count, codec, label_counts, label_sizes
+            )
+            priority = (
+                selection.score,
+                selection.count,
+                codec.sort_key(parent_id),
+                codec.sort_key(child_id),
+            )
+            if best_priority is None or priority > best_priority:
+                best_priority = priority
+                best = selection
+        return best
+
     def _fit(self, graphs: Sequence[nx.DiGraph]) -> tuple[TreeEncoder, TreeDecoder]:
         self.backend_used_ = "python"
         input_alphabet = infer_input_alphabet(
@@ -234,22 +280,29 @@ class GreedyStarBPECoarsener(EdgeBPECoarsener):
         encoding_rules: list[EncodingRule] = []
         self.history_ = []
         rank = 0
-        # When set, the pair to prefer on the next iteration: the most recently
-        # created token paired again with the same child label.
-        greedy_key: EdgeKey | None = None
+        # When set, the freshly created token to keep extending: the chain
+        # greedily absorbs any of its children whose label is structurally one of
+        # the token's own merged components.  ``component_closure`` maps every
+        # learned token to that set of component labels (its merge-closure).
+        greedy_parent: int | None = None
+        component_closure: dict[int, frozenset[int]] = {}
 
         while self.num_merges is None or rank < self.num_merges:
             best: _PairSelection | None = None
             is_greedy = False
-            if greedy_key is not None:
-                greedy_count = counts.get(greedy_key, 0)
+            if greedy_parent is not None:
                 # ``min_pair_count`` gates only the global pick that *starts* a
-                # chain; once a star is being consumed, keep eating identical
+                # chain; once a star is being consumed keep eating component-equal
                 # children as long as at least one remains.
-                if greedy_count >= 1:
-                    best = self._selection_for_key(
-                        greedy_key, greedy_count, codec, label_counts, label_sizes
-                    )
+                best = self._best_greedy_continuation(
+                    greedy_parent,
+                    component_closure.get(greedy_parent, frozenset()),
+                    counts,
+                    codec,
+                    label_counts,
+                    label_sizes,
+                )
+                if best is not None:
                     is_greedy = True
             if best is None:
                 best = self._select_best_pair(
@@ -281,6 +334,14 @@ class GreedyStarBPECoarsener(EdgeBPECoarsener):
                 label_id=new_id,
                 size=best.parent_size + best.child_size,
             )
+            # Merge-closure of the new token: its two direct operands plus all of
+            # their own components.  A child carrying any of these labels is a
+            # structural copy of a component, so the greedy chain absorbs it.
+            component_closure[new_id] = (
+                frozenset((parent_id, child_id))
+                | component_closure.get(parent_id, frozenset())
+                | component_closure.get(child_id, frozenset())
+            )
 
             actual_events = sum(
                 state.contract_pair(key, new_label=new_id, pair_counts=counts)
@@ -298,7 +359,8 @@ class GreedyStarBPECoarsener(EdgeBPECoarsener):
                 # so this is unreachable; recover defensively all the same.
                 vocab.symbols.pop(token, None)
                 counts.pop(key, None)
-                greedy_key = None
+                component_closure.pop(new_id, None)
+                greedy_parent = None
                 continue
 
             rule = EdgeBPERule(
@@ -361,8 +423,9 @@ class GreedyStarBPECoarsener(EdgeBPECoarsener):
                 }
             )
 
-            # Continue eating the same child off the freshly created token.
-            greedy_key = (new_id, child_id)
+            # Continue eating component-equal children off the freshly created
+            # token (the original repeated child and any condensed siblings).
+            greedy_parent = new_id
             rank += 1
 
         output_raw = all(graph.graph.get(RAW_INPUT_FLAG, False) for graph in graphs)
