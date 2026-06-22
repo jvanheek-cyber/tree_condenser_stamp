@@ -63,12 +63,12 @@ class TreeCoarsener(ABC):
         self.decoder_ = decoder
         return self
 
-    def transform(self, graph: nx.DiGraph, *, validate: bool = True) -> nx.DiGraph:
+    def transform(self, graph: nx.DiGraph, *, validate: bool = True, **kwargs) -> nx.DiGraph:
         """Encode one graph using the fitted encoder."""
 
         if self.encoder_ is None:
             raise NotFittedError("Call fit before transform.")
-        return self.encoder_.encode(graph, validate=validate)
+        return self.encoder_.encode(graph, validate=validate, **kwargs)
 
     def fit_transform(
         self, graphs: Sequence[nx.DiGraph], *, validate: bool = True

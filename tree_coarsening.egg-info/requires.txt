@@ -1,0 +1,11 @@
+networkx>=3.0
+
+[dev]
+pytest>=7.0
+nbformat>=5.0
+nbclient>=0.8
+ipykernel>=6.0
+
+[numba]
+numpy>=1.24
+numba>=0.60

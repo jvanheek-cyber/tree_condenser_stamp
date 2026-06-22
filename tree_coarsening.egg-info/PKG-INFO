@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: tree-coarsening
+Version: 0.6.1
+Summary: BPE-like coarsening of labeled directed trees represented as NetworkX graphs
+Author: Tree Coarsening Contributors
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: networkx>=3.0
+Provides-Extra: numba
+Requires-Dist: numpy>=1.24; extra == "numba"
+Requires-Dist: numba>=0.60; extra == "numba"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: nbformat>=5.0; extra == "dev"
+Requires-Dist: nbclient>=0.8; extra == "dev"
+Requires-Dist: ipykernel>=6.0; extra == "dev"

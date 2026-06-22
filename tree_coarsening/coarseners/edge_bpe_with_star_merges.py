@@ -1,17 +1,32 @@
-"""Edge-only BPE coarsener for directed labeled trees.
+"""Edge-BPE coarsener with star merges for directed labeled trees.
+
+This variant behaves like :mod:`edge_bpe` when selecting which pair to merge:
+at each step the highest-scoring encoded edge
+``(parent_token, child_token, attachment_site)`` is chosen by its raw matching
+edge count.  It differs in the *transform* step.  Instead of contracting a
+single parent/child pair, every parent that has several matching children at the
+same attachment site has *all* of those children contracted into the parent at
+once, exactly as :class:`~tree_coarsening.coarseners.star.StarCoarsener` would
+contract a labeled starburst -- but restricted to the candidate children of the
+selected pair rather than to every star in the tree.
+
+A merge that contracts ``k`` matching children produces an arity-``k`` token.
+As with the star coarsener, distinct arities create distinct vocabulary tokens,
+so a single selected pair can introduce one token per observed arity.
 
 The public boundary uses NetworkX graphs and tuple-valued ``attach_map``
 attributes.  Fitting and encoding use a compact mutable tree with integer token
 ids and scalar attachment sites.  The scalar representation is exact here
-because base tokens and edge-only BPE tokens always expose exactly one root.
+because base tokens and the tokens produced by this coarsener always expose
+exactly one root.
 """
 
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from collections.abc import Hashable as HashableABC, Sequence
+from collections.abc import Callable, Hashable as HashableABC, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any
 
 import networkx as nx
 
@@ -24,41 +39,74 @@ from ..provenance import NODE_ATTRS_KEY, PROVENANCE_KEY
 from ..validation import validate_encoded_tree, validate_raw_tree
 from ..vocabulary import AttachMap, Token, VocabEntry, Vocabulary, base_token
 
-# Edge-only tokens expose one root, so a live edge needs one integer attachment
-# site internally.  The public API converts it back to ``(attach_site,)``.
+# The tokens produced here expose one root, so a live edge needs one integer
+# attachment site internally.  The public API converts it back to
+# ``(attach_site,)``.
 EdgeKey = tuple[int, int, int]
+
+# Maps an arity to ``(token, interned_id, new_site_count)`` for that arity, or
+# ``None`` when no token exists for the arity (used by encode time).
+TokenForArity = Callable[[int], "tuple[Token, int, int] | None"]
 
 
 def edge_bpe_token(rank: int) -> tuple[str, int]:
-    """Stable token id for the ``rank``-th learned edge-BPE merge."""
+    """Stable token id for the arity-one (single child) merge at ``rank``."""
 
     if rank < 0:
         raise ValidationError("edge-BPE rank must be nonnegative.")
     return ("edge_bpe", int(rank))
 
 
+def edge_star_token(rank: int, arity: int) -> tuple[str, int, int]:
+    """Stable token id for the ``rank``-th merge that contracts ``arity`` children.
+
+    Arity one reuses :func:`edge_bpe_token` so a star variant that never finds a
+    multi-child group is byte-for-byte compatible with the plain edge coarsener.
+    """
+
+    if rank < 0:
+        raise ValidationError("edge-star rank must be nonnegative.")
+    if arity < 1:
+        raise ValidationError("edge-star arity must be positive.")
+    return ("edge_star", int(rank), int(arity))
+
+
+def merge_token(rank: int, arity: int) -> Token:
+    """Return the token id for a merge of ``arity`` children at ``rank``."""
+
+    if arity == 1:
+        return edge_bpe_token(rank)
+    return edge_star_token(rank, arity)
+
+
 @dataclass(frozen=True, slots=True)
-class EdgeBPERule:
-    """One fitted edge-contraction rule.
+class EdgeStarRule:
+    """One fitted merge rule for a selected ``(parent, child, site)`` pair.
 
     ``count`` is the raw number of matching encoded edges when the rule was
-    selected.  Overlapping occurrences are included, even though the rule's
-    contraction pass can merge only a vertex-disjoint subset of them.
+    selected.  ``arities`` lists every contracted-group size observed when the
+    rule's transform ran, and ``tokens`` is the position-aligned token id for
+    each arity.  Each arity maps to its own vocabulary entry.
     """
 
     rank: int
-    token: Token
     parent_token: Token
     child_token: Token
     attach_map: AttachMap
     count: int
+    arities: tuple[int, ...]
+    tokens: tuple[Token, ...]
 
     def __post_init__(self) -> None:
         if len(self.attach_map) != 1:
-            raise ValidationError("edge-only BPE rules require a one-entry attach_map.")
+            raise ValidationError("edge-only merge rules require a one-entry attach_map.")
         site = self.attach_map[0]
         if not isinstance(site, int) or isinstance(site, bool) or site < 0:
             raise ValidationError(f"invalid edge attachment site {site!r}.")
+        if len(self.arities) != len(self.tokens):
+            raise ValidationError("arities and tokens must be position aligned.")
+        if any(arity < 1 for arity in self.arities):
+            raise ValidationError("edge-star arities must be positive.")
 
     @property
     def attach_site(self) -> int:
@@ -94,19 +142,18 @@ class _TokenCodec:
 class _UidRope:
     """Append-only concatenation tree for occurrence provenance.
 
-    Repeated edge contractions create one pair of integer references instead of
-    repeatedly copying growing UID tuples.  Flattening occurs once, when the
-    final encoded NetworkX graph is produced.
+    Repeated contractions create one node per merge instead of repeatedly
+    copying growing UID tuples.  Flattening occurs once, when the final encoded
+    NetworkX graph is produced.  A merge may concatenate more than two children
+    (a star group), so each rope node stores an ordered list of references.
     """
 
     leaves: list[Any]
-    left: list[int] = field(default_factory=list)
-    right: list[int] = field(default_factory=list)
+    refs: list[tuple[int, ...]] = field(default_factory=list)
 
-    def merge(self, left_ref: int, right_ref: int) -> int:
-        ref = len(self.leaves) + len(self.left)
-        self.left.append(left_ref)
-        self.right.append(right_ref)
+    def merge(self, parts: Sequence[int]) -> int:
+        ref = len(self.leaves) + len(self.refs)
+        self.refs.append(tuple(parts))
         return ref
 
     def flatten(self, ref: int) -> tuple[Any, ...]:
@@ -119,11 +166,11 @@ class _UidRope:
                 out.append(self.leaves[current])
                 continue
             merge_index = current - leaf_count
-            if merge_index < 0 or merge_index >= len(self.left):
+            if merge_index < 0 or merge_index >= len(self.refs):
                 raise RuntimeError(f"invalid provenance-rope reference {current!r}.")
-            # Stack is LIFO; push right first to preserve left-to-right site order.
-            stack.append(self.right[merge_index])
-            stack.append(self.left[merge_index])
+            # Stack is LIFO; push in reverse to preserve left-to-right order.
+            for part in reversed(self.refs[merge_index]):
+                stack.append(part)
         return tuple(out)
 
 
@@ -153,12 +200,12 @@ def _bump_count(counts: Counter[EdgeKey], key: EdgeKey, delta: int) -> None:
 
 @dataclass(slots=True)
 class _CompactEdgeTree:
-    """Mutable array-backed tree used by the edge-BPE inner loop.
+    """Mutable array-backed tree used by the edge-star inner loop.
 
     The central arrays are ``parent``, ``children``, ``label``, and ``time``.
-    Contraction keeps the parent position alive and removes the child position,
-    so array lengths never grow.  Fit-time states omit provenance and all
-    output-only metadata.
+    Contraction keeps the parent position alive and removes the contracted
+    children positions, so array lengths never grow.  Fit-time states omit
+    provenance and all output-only metadata.
     """
 
     parent: list[int]
@@ -346,104 +393,151 @@ class _CompactEdgeTree:
         p = self.parent[child]
         return (self.time[child], self.time[p], p, child)
 
-    def contract_and_count_pairs(
+    def contract_star_groups(
         self,
         key: EdgeKey,
         *,
-        new_label: int,
+        token_for_arity: TokenForArity,
         pair_counts: Counter[EdgeKey] | None = None,
-    ) -> int:
-        """Contract a deterministic vertex-disjoint subset of matching edges.
+    ) -> dict[int, int]:
+        """Contract matching children into their parents as star groups.
+
+        Every parent that has one or more live children matching ``key`` has all
+        of those children contracted into it at once.  The number of merged
+        children (the arity) selects the replacement token via
+        ``token_for_arity``; an arity whose token is missing (``None``) is left
+        uncontracted.  Returns a mapping from arity to the number of merge
+        events of that arity.
 
         ``pair_counts`` continues to count all live matching edges, including
-        overlapping ones.  Local updates remove the edges incident to each
-        contracted pair, mutate the compact tree, and add the replacement
-        incident edges.
+        overlapping ones from other parents.  Local updates remove the edges
+        incident to each contracted group, mutate the compact tree, and add the
+        replacement incident edges.
         """
 
         bucket = self.edge_index.get(key)
         if not bucket:
-            return 0
-        candidates = sorted(bucket, key=self._edge_sort_key)
-        used: set[int] = set()
-        n_events = 0
+            return {}
 
-        for child in candidates:
+        # Group candidate children by their (live) parent.  Children are sorted
+        # deterministically so the contracted recipe order is reproducible.
+        groups: dict[int, list[int]] = defaultdict(list)
+        for child in sorted(bucket, key=self._edge_sort_key):
             if not self._edge_is_live(child):
                 continue
-            parent = self.parent[child]
-            if parent in used or child in used:
+            if self._edge_key_unchecked(child) != key:
                 continue
-            if self._edge_key(child) != key:
-                continue
-            self._contract_edge(parent, child, new_label=new_label, pair_counts=pair_counts)
-            used.add(parent)
-            used.add(child)
-            n_events += 1
-        return n_events
+            groups[self.parent[child]].append(child)
 
-    def _contract_edge(
+        events_by_arity: dict[int, int] = defaultdict(int)
+        # Sort parents for a deterministic contraction order.  A parent is never
+        # itself one of the matching children of another group for the same key
+        # (that would require two live incoming edges), so groups are disjoint.
+        for parent_node in sorted(groups, key=lambda p: (self.time[p], p)):
+            members = groups[parent_node]
+            arity = len(members)
+            resolved = token_for_arity(arity)
+            if resolved is None:
+                continue
+            _token, new_label, new_site_count = resolved
+            self._contract_star_group(
+                parent_node,
+                members,
+                new_label=new_label,
+                new_site_count=new_site_count,
+                pair_counts=pair_counts,
+            )
+            events_by_arity[arity] += 1
+        return dict(events_by_arity)
+
+    def _contract_star_group(
         self,
         parent_node: int,
-        child_node: int,
+        child_nodes: Sequence[int],
         *,
         new_label: int,
+        new_site_count: int,
         pair_counts: Counter[EdgeKey] | None,
     ) -> int:
-        """Contract ``parent_node -> child_node`` in place at ``parent_node``."""
+        """Contract ``parent_node`` together with all ``child_nodes`` in place.
 
-        if not self._edge_is_live(child_node) or self.parent[child_node] != parent_node:
-            raise ValidationError("attempted to contract a non-live edge occurrence.")
+        The new token's site layout is the parent's sites followed by each
+        contracted child's sites in ``child_nodes`` order.  Grandchildren of the
+        ``j``-th contracted child shift by the parent's site count plus the
+        cumulative site count of the children that precede it.
+        """
+
+        if not child_nodes:
+            raise ValidationError("a star group must contain at least one child.")
+
+        for child_node in child_nodes:
+            if not self._edge_is_live(child_node) or self.parent[child_node] != parent_node:
+                raise ValidationError("attempted to contract a non-live edge occurrence.")
 
         grandparent = self.parent[parent_node]
         parent_site_count = self._site_count(self.label[parent_node])
-        old_parent_children = self.children[parent_node]
-        child_children = self.children[child_node]
+        child_set = set(child_nodes)
 
-        # Remove every edge whose key will disappear or change.  This is the
-        # incoming edge to the surviving parent, all old parent edges (including
-        # the contracted edge), and all outgoing edges of the removed child.
+        # Remove every edge whose key will disappear or change: the parent's
+        # incoming edge, every old parent edge (the contracted children plus the
+        # parent's other children), and the outgoing edges of each contracted
+        # child.
         if grandparent != -1:
             self._remove_edge_from_index(parent_node, pair_counts=pair_counts)
 
-        remaining_parent_children: list[int] = []
-        found_child = False
-        for current_child in old_parent_children:
+        retained_parent_children: list[int] = []
+        for current_child in self.children[parent_node]:
             self._remove_edge_from_index(current_child, pair_counts=pair_counts)
-            if current_child == child_node:
-                found_child = True
-            else:
-                remaining_parent_children.append(current_child)
-        if not found_child:
-            raise RuntimeError("contracted child is missing from its parent's child list.")
+            if current_child not in child_set:
+                retained_parent_children.append(current_child)
 
-        for current_child in child_children:
-            self._remove_edge_from_index(current_child, pair_counts=pair_counts)
+        for child_node in child_nodes:
+            for grandchild in self.children[child_node]:
+                self._remove_edge_from_index(grandchild, pair_counts=pair_counts)
 
         # The parent array position survives.  This avoids appending replacement
         # nodes and keeps compact arrays bounded by the original number of nodes.
+        merged_time = self.time[parent_node]
+        for child_node in child_nodes:
+            merged_time = min(merged_time, self.time[child_node])
         self.label[parent_node] = new_label
-        self.time[parent_node] = min(self.time[parent_node], self.time[child_node])
+        self.time[parent_node] = merged_time
 
         if self.uid_ref is not None:
             if self.output is None:
                 raise RuntimeError("uid_ref exists without an output context.")
-            self.uid_ref[parent_node] = self.output.uid_rope.merge(
-                self.uid_ref[parent_node], self.uid_ref[child_node]
+            parts = [self.uid_ref[parent_node]]
+            parts.extend(self.uid_ref[child_node] for child_node in child_nodes)
+            self.uid_ref[parent_node] = self.output.uid_rope.merge(parts)
+
+        # Reparent grandchildren, offsetting their attachment site into the new
+        # token's coordinate space.  The offset advances by each child's site
+        # count so the layout matches the recipe (P, C_1, ..., C_k).
+        new_parent_children = retained_parent_children
+        site_offset = parent_site_count
+        for child_node in child_nodes:
+            child_site_count = self._site_count(self.label[child_node])
+            for grandchild in self.children[child_node]:
+                self.parent[grandchild] = parent_node
+                self.attach_to_parent[grandchild] += site_offset
+                new_parent_children.append(grandchild)
+            site_offset += child_site_count
+
+        if site_offset != new_site_count:
+            raise RuntimeError(
+                f"star merge site layout mismatch: computed {site_offset}, "
+                f"vocabulary reports {new_site_count}."
             )
-            self.uid_ref[child_node] = -1
 
-        for current_child in child_children:
-            self.parent[current_child] = parent_node
-            self.attach_to_parent[current_child] += parent_site_count
+        for child_node in child_nodes:
+            self.alive[child_node] = False
+            self.parent[child_node] = -1
+            self.children[child_node] = []
+            self.attach_to_parent[child_node] = -1
+            if self.uid_ref is not None:
+                self.uid_ref[child_node] = -1
 
-        remaining_parent_children.extend(child_children)
-        self.children[parent_node] = remaining_parent_children
-
-        self.alive[child_node] = False
-        self.parent[child_node] = -1
-        self.children[child_node] = []
-        self.attach_to_parent[child_node] = -1
+        self.children[parent_node] = new_parent_children
 
         # Reinsert the changed incoming edge and all outgoing edges of the new
         # token occurrence.  Counts remain raw edge-occurrence counts.
@@ -513,13 +607,56 @@ class _CompactEdgeTree:
         return H
 
 
+def _star_vocab_entry(
+    token: Token,
+    *,
+    parent_token: Token,
+    child_token: Token,
+    attach_site: int,
+    arity: int,
+    rank: int,
+    count: int,
+    min_pair_count: int,
+) -> VocabEntry:
+    """Build the recipe for a merge of ``arity`` ``child_token`` children.
+
+    The recipe is the parent token followed by ``arity`` copies of the child
+    token, every child attaching to the parent (component 0) at ``attach_site``.
+    """
+
+    public_attach_map = (attach_site,)
+    label = (parent_token, *([child_token] * arity))
+    parent = (-1, *([0] * arity))
+    attach = tuple(attach_site for _ in range(arity))
+    return VocabEntry(
+        token=token,
+        parent=parent,
+        label=label,
+        attach=attach,
+        created_at_step=rank,
+        operation="edge" if arity == 1 else "siblings",
+        score=float(count),
+        metadata={
+            "coarsener": "EdgeBPEWithStarMergesCoarsener",
+            "rank": rank,
+            "arity": arity,
+            "count": count,
+            "count_semantics": "raw_matching_edges",
+            "min_pair_count": min_pair_count,
+            "parent_token": parent_token,
+            "child_token": child_token,
+            "attach_map": public_attach_map,
+        },
+    )
+
+
 @dataclass
-class EdgeBPEEncoder(TreeEncoder):
-    """Encoder artifact for :class:`EdgeBPECoarsener`."""
+class EdgeBPEWithStarMergesEncoder(TreeEncoder):
+    """Encoder artifact for :class:`EdgeBPEWithStarMergesCoarsener`."""
 
-    edge_rules: tuple[EdgeBPERule, ...] = ()
+    edge_rules: tuple[EdgeStarRule, ...] = ()
 
-    def encode(self, G: nx.DiGraph, *, validate: bool = True, max_steps: int = None) -> nx.DiGraph:
+    def encode(self, G: nx.DiGraph, *, validate: bool = True) -> nx.DiGraph:
         if validate:
             validate_raw_tree(
                 G,
@@ -532,22 +669,6 @@ class EdgeBPEEncoder(TreeEncoder):
         codec = _TokenCodec()
         for label in sorted(self.base_labels):
             codec.intern(base_token(label))
-        # entries = {}
-        # creation_order = []
-        # for i, token in enumerate(self.vocab.creation_order):
-        #     if max_steps is not None and i >= max_steps:
-        #         break
-        #     entry = self.vocab.entries[token]
-        #     for child_token in entry.label:
-        #         codec.intern(child_token)
-        #     codec.intern(token)
-        #     entries[token] = entry
-        #     creation_order.append(token)
-
-        # vocab = Vocabulary(
-        #     entries=entries,
-        #     creation_order=creation_order
-        # )
         for token in self.vocab.creation_order:
             entry = self.vocab.entries[token]
             for child_token in entry.label:
@@ -567,29 +688,44 @@ class EdgeBPEEncoder(TreeEncoder):
             capture_output=True,
         )
 
-        for i, rule in enumerate(self.edge_rules):
-            if max_steps is not None and i >= max_steps:
-                break
+        for rule in self.edge_rules:
             parent_id = state.codec.intern(rule.parent_token)
             child_id = state.codec.intern(rule.child_token)
-            new_id = state.codec.intern(rule.token)
-            state.contract_and_count_pairs(
+            # Only arities present in the fitted vocabulary can contract; a
+            # transform-time arity not seen during fit is left uncontracted,
+            # matching the star coarsener's fixed-vocabulary behavior.
+            token_by_arity: dict[int, Token] = dict(zip(rule.arities, rule.tokens))
+
+            def token_for_arity(arity: int, _by=token_by_arity) -> tuple[Token, int, int] | None:
+                token = _by.get(arity)
+                if token is None:
+                    return None
+                token_id = state.codec.intern(token)
+                return token, token_id, self.vocab.site_count(token)
+
+            state.contract_star_groups(
                 (parent_id, child_id, rule.attach_site),
-                new_label=new_id,
+                token_for_arity=token_for_arity,
                 pair_counts=None,
             )
 
         return state.to_networkx(validate=validate)
 
 
-class EdgeBPECoarsener(TreeCoarsener):
-    """Byte-pair-style coarsener that learns only edge contractions.
+class EdgeBPEWithStarMergesCoarsener(TreeCoarsener):
+    """Byte-pair-style coarsener that contracts candidate children as stars.
 
-    At each step, the score of a pair is its raw number of matching encoded
-    edges ``(parent_token, child_token, attachment_site)``.  Overlapping matches
-    count toward the score.  After a rule is selected, its transform contracts a
-    deterministic vertex-disjoint subset of those occurrences, exactly as a BPE
-    pass must avoid using one token occurrence twice.
+    Pair selection is identical to :class:`EdgeBPECoarsener`: at each step the
+    score of a pair is its raw number of matching encoded edges
+    ``(parent_token, child_token, attachment_site)``, and overlapping matches
+    count toward the score.  The transform differs.  After a rule is selected,
+    every parent that has multiple matching children at the selected attachment
+    site has *all* of those children contracted together with the parent into a
+    single new node, exactly as the star coarsener would contract a labeled
+    starburst -- but only over the candidate children of the selected pair.
+
+    Distinct arities produce distinct vocabulary tokens, so a single selected
+    pair may introduce one token per observed arity.
     """
 
     def __init__(
@@ -597,7 +733,6 @@ class EdgeBPECoarsener(TreeCoarsener):
         *,
         num_merges: int | None = None,
         min_pair_count: int = 2,
-        backend: Literal["python", "numba"] = "python",
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -605,21 +740,11 @@ class EdgeBPECoarsener(TreeCoarsener):
             raise ValueError("num_merges must be None or nonnegative.")
         if min_pair_count < 1:
             raise ValueError("min_pair_count must be at least 1.")
-        if backend not in {"python", "numba"}:
-            raise ValueError("backend must be 'python' or 'numba'.")
         self.num_merges = num_merges
         self.min_pair_count = min_pair_count
-        self.backend = backend
         self.history_: list[dict[str, Any]] = []
 
     def _fit(self, graphs: Sequence[nx.DiGraph]) -> tuple[TreeEncoder, TreeDecoder]:
-        use_numba = self.backend == "numba"
-        numba_forest: Any | None = None
-        if use_numba:
-            from .edge_bpe_numba import NumbaTrainingForest, require_numba
-
-            require_numba()
-
         vocab = Vocabulary()
         codec = _TokenCodec()
         pair_counts: Counter[EdgeKey] = Counter()
@@ -643,134 +768,119 @@ class EdgeBPECoarsener(TreeCoarsener):
                     label_attr=self.label_attr,
                     time_attr=self.time_attr,
                     uid_attr=self.uid_attr,
-                    pair_counts=None if use_numba else pair_counts,
+                    pair_counts=pair_counts,
                     base_labels=base_labels,
                     capture_output=False,
-                    build_edge_index=not use_numba,
+                    build_edge_index=True,
                 )
             )
 
-        if use_numba:
-            max_possible_merges = sum(len(state.parent) - 1 for state in states)
-            if self.num_merges is not None:
-                max_possible_merges = min(max_possible_merges, self.num_merges)
-            numba_forest = NumbaTrainingForest.from_compact_states(
-                states,
-                label_capacity=len(codec.id_to_token) + max_possible_merges,
-            )
-            # The compiled forest now owns independent NumPy arrays; release the
-            # temporary Python list-of-lists states before entering the merge loop.
-            states.clear()
-
-        edge_rules: list[EdgeBPERule] = []
+        edge_rules: list[EdgeStarRule] = []
         encoding_rules: list[EncodingRule] = []
         self.history_ = []
 
         rank = 0
         while self.num_merges is None or rank < self.num_merges:
-            if numba_forest is None:
-                best = self._select_best_pair(pair_counts, codec)
-            else:
-                best = numba_forest.select_best_pair(self.min_pair_count, codec)
+            best = self._select_best_pair(pair_counts, codec)
             if best is None:
                 break
             best_key, best_count = best
             parent_id, child_id, attach_site = best_key
             parent_token = codec.decode(parent_id)
             child_token = codec.decode(child_id)
-            token = edge_bpe_token(rank)
             public_attach_map = (attach_site,)
 
-            entry = VocabEntry(
-                token=token,
-                parent=(-1, 0),
-                label=(parent_token, child_token),
-                attach=public_attach_map,
-                created_at_step=rank,
-                operation="edge",
-                score=float(best_count),
-                metadata={
-                    "coarsener": "EdgeBPECoarsener",
-                    "rank": rank,
-                    "count": best_count,
-                    "count_semantics": "raw_matching_edges",
-                    "min_pair_count": self.min_pair_count,
-                    "parent_token": parent_token,
-                    "child_token": child_token,
-                    "attach_map": public_attach_map,
-                },
-            )
-            vocab.add(entry)
-            new_id = codec.intern(token)
+            # Lazily create one vocabulary token per arity actually contracted,
+            # so a single selected pair can spawn several arities.  Tokens and
+            # their interned ids are cached for the duration of this rank.
+            tokens_by_arity: dict[int, Token] = {}
 
-            if numba_forest is None:
-                actual_events = 0
-                for state in states:
-                    actual_events += state.contract_and_count_pairs(
-                        best_key,
-                        new_label=new_id,
-                        pair_counts=pair_counts,
+            def token_for_arity(arity: int) -> tuple[Token, int, int] | None:
+                token = tokens_by_arity.get(arity)
+                if token is None:
+                    token = merge_token(rank, arity)
+                    entry = _star_vocab_entry(
+                        token,
+                        parent_token=parent_token,
+                        child_token=child_token,
+                        attach_site=attach_site,
+                        arity=arity,
+                        rank=rank,
+                        count=best_count,
+                        min_pair_count=self.min_pair_count,
                     )
-            else:
-                numba_forest.register_label(new_id, vocab.site_count(token))
-                actual_events = numba_forest.contract_pair(best_key, new_label=new_id)
+                    vocab.add(entry)
+                    tokens_by_arity[arity] = token
+                token_id = codec.intern(token)
+                return token, token_id, vocab.site_count(token)
 
-            if actual_events == 0:
+            events_by_arity: dict[int, int] = defaultdict(int)
+            for state in states:
+                for arity, n_events in state.contract_star_groups(
+                    best_key,
+                    token_for_arity=token_for_arity,
+                    pair_counts=pair_counts,
+                ).items():
+                    events_by_arity[arity] += n_events
+
+            if not tokens_by_arity:
                 # With correct incremental counts this cannot happen: any
-                # nonempty matching-edge set has at least one contractible edge.
-                # Keep a defensive rollback for the Python index.  The compiled
-                # index deliberately exposes no mutation hook for an impossible
-                # stale bucket, so fail loudly rather than looping forever.
-                if numba_forest is None:
-                    pair_counts.pop(best_key, None)
-                    vocab.remove_last(token)
-                    continue
-                raise RuntimeError(
-                    "Numba pair index selected a positive-count pair with no "
-                    "contractible occurrence."
-                )
+                # nonempty matching-edge set has at least one contractible group.
+                pair_counts.pop(best_key, None)
+                continue
 
-            rule = EdgeBPERule(
+            arities = tuple(sorted(tokens_by_arity))
+            tokens = tuple(tokens_by_arity[arity] for arity in arities)
+            rule = EdgeStarRule(
                 rank=rank,
-                token=token,
                 parent_token=parent_token,
                 child_token=child_token,
                 attach_map=public_attach_map,
                 count=best_count,
+                arities=arities,
+                tokens=tokens,
             )
             edge_rules.append(rule)
-            encoding_rules.append(
-                EncodingRule(
-                    token=token,
-                    operation="edge",
-                    created_at_step=rank,
-                    pattern={
-                        "parent_token": parent_token,
-                        "child_token": child_token,
-                        "attach_map": public_attach_map,
-                    },
-                    score=float(best_count),
-                    metadata={
-                        "actual_events": actual_events,
-                        "count_semantics": "raw_matching_edges",
-                    },
+
+            actual_events = sum(events_by_arity.values())
+            events_summary = {arity: events_by_arity[arity] for arity in arities}
+            for arity in arities:
+                token = tokens_by_arity[arity]
+                encoding_rules.append(
+                    EncodingRule(
+                        token=token,
+                        operation="edge" if arity == 1 else "siblings",
+                        created_at_step=rank,
+                        pattern={
+                            "parent_token": parent_token,
+                            "child_token": child_token,
+                            "attach_map": public_attach_map,
+                            "arity": arity,
+                        },
+                        score=float(best_count),
+                        metadata={
+                            "actual_events": events_by_arity[arity],
+                            "count_semantics": "raw_matching_edges",
+                        },
+                    )
                 )
-            )
             self.history_.append(
                 {
                     "rank": rank,
-                    "token": token,
                     "parent_token": parent_token,
                     "child_token": child_token,
                     "attach_map": public_attach_map,
                     "count": best_count,
                     "count_semantics": "raw_matching_edges",
+                    "arities": arities,
+                    "tokens": tokens,
                     "actual_events": actual_events,
+                    "events_by_arity": events_summary,
                 }
             )
             rank += 1
 
-        encoder = EdgeBPEEncoder(
+        encoder = EdgeBPEWithStarMergesEncoder(
             model_id=self.model_id,
             vocab=vocab,
             rules=tuple(encoding_rules),
