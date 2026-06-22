@@ -1,12 +1,12 @@
 """Concrete coarsener implementations."""
 
 from .edge_bpe import EdgeBPECoarsener, EdgeBPEEncoder, EdgeBPERule, edge_bpe_token
-from .edge_bpe_with_star_merges import (
-    EdgeBPEWithStarMergesCoarsener,
-    EdgeBPEWithStarMergesEncoder,
+from .edge_bpe_greedy_star import GreedyStarBPECoarsener, GreedyStarBPEEncoder
+from .edge_bpe_with_auto_star_coarsening import (
+    EdgeBPEWithAutoStarCoarsener,
+    EdgeBPEWithAutoStarEncoder,
     EdgeStarRule,
     edge_star_token,
-    merge_token,
 )
 from .star import StarCoarsener, StarEncoder, StarRule, star_token
 from .named_vertices import (
@@ -19,9 +19,11 @@ __all__ = [
     "EdgeBPECoarsener",
     "EdgeBPEEncoder",
     "EdgeBPERule",
-    "EdgeBPEWithStarMergesCoarsener",
-    "EdgeBPEWithStarMergesEncoder",
+    "EdgeBPEWithAutoStarCoarsener",
+    "EdgeBPEWithAutoStarEncoder",
     "EdgeStarRule",
+    "GreedyStarBPECoarsener",
+    "GreedyStarBPEEncoder",
     "NamedVertexCoarsener",
     "NamedVertexEncoder",
     "StarCoarsener",
@@ -29,7 +31,6 @@ __all__ = [
     "StarRule",
     "edge_bpe_token",
     "edge_star_token",
-    "merge_token",
     "named_component_token",
     "star_token",
 ]

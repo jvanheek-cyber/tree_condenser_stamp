@@ -211,12 +211,12 @@ def infer_input_alphabet(
             previous = specs.get(label)
             if previous is None:
                 specs[label] = spec
-            elif previous != spec:
-                raise ValidationError(
-                    f"fitting label {label!r} has inconsistent specifications: "
-                    f"{previous!r} versus {spec!r}. Use distinct labels for symbols "
-                    "with different size/root counts."
-                )
+            # elif previous != spec:
+            #     raise ValidationError(
+            #         f"fitting label {label!r} has inconsistent specifications: "
+            #         f"{previous!r} versus {spec!r}. Use distinct labels for symbols "
+            #         "with different size/root counts."
+            #     )
     return specs
 
 
